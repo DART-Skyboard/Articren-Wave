@@ -105,6 +105,8 @@ button {
 
 </style>
      <link rel="shortcut icon" type="image/x-icon" href="https://static.wixstatic.com/media/2451db_332deb9f8af746d9b3f12ac1e691c396~mv2.png">
+     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 </head>
 <body>
 
@@ -150,6 +152,7 @@ button {
   <div class="controls">
     <button id="add-stave">Add Grand Staff</button>
     <button id="playback">Play</button>
+    <button id="export-pdf">Export PDF</button>
   </div>
 </div>
 <br>
@@ -216,31 +219,98 @@ const div = document.getElementById("vf");
 const renderer = new VF.Renderer(div, VF.Renderer.Backends.SVG);
 renderer.resize(window.innerWidth, window.innerHeight);
 
+let scoreNotes = [];
+let trebleStaves = [];
+let bassStaves = [];
+let staveElementGroups = []; // To store notes for each stave group
+
 window.onload = function() {
     document.getElementById('add-stave').addEventListener('click', addStave);
+    document.getElementById('export-pdf').addEventListener('click', exportPDF);
 };
 
+function exportPDF() {
+    const vexflowDiv = document.getElementById('vf');
+    if (!vexflowDiv) {
+        console.error("VexFlow container div ('vf') not found.");
+        return;
+    }
+
+    html2canvas(vexflowDiv, {
+        allowTaint: true,
+        useCORS: true,
+        backgroundColor: '#ffffff', // Ensure white background
+        logging: true, // Enable logging for debugging html2canvas issues
+        onclone: (documentClone) => {
+            // Fix for VexFlow SVG elements not rendering correctly in html2canvas sometimes
+            // by ensuring they are explicitly sized and styled in the cloned document.
+            const vfClone = documentClone.getElementById('vf');
+            if (vfClone) {
+                const svgs = vfClone.getElementsByTagName('svg');
+                for (let svg of svgs) {
+                    svg.style.width = svg.clientWidth + 'px';
+                    svg.style.height = svg.clientHeight + 'px';
+                }
+            }
+        }
+    }).then((canvas) => {
+        const imgData = canvas.toDataURL('image/png');
+        const { jsPDF } = window.jspdf;
+
+        // Determine PDF orientation based on image aspect ratio
+        let orientation = 'p'; // portrait
+        if (canvas.width > canvas.height) {
+            orientation = 'l'; // landscape
+        }
+        const pdf = new jsPDF(orientation, 'mm', 'a4');
+
+        const pdfWidth = pdf.internal.pageSize.getWidth();
+        const pdfHeight = pdf.internal.pageSize.getHeight();
+
+        const imgWidth = canvas.width;
+        const imgHeight = canvas.height;
+
+        // Calculate scaling to fit the image onto the PDF page
+        const ratio = Math.min(pdfWidth / imgWidth, pdfHeight / imgHeight);
+        const scaledWidth = imgWidth * ratio;
+        const scaledHeight = imgHeight * ratio;
+
+        // Calculate centering offsets
+        const xOffset = (pdfWidth - scaledWidth) / 2;
+        const yOffset = (pdfHeight - scaledHeight) / 2; // Or 0 if starting from top; centering is usually better.
+
+        pdf.addImage(imgData, 'PNG', xOffset, yOffset, scaledWidth, scaledHeight);
+        pdf.save('articren-wave-score.pdf');
+    }).catch(error => {
+        console.error("Error during PDF export:", error);
+        alert("Failed to export PDF. See console for details.");
+    });
+}
+
 function addStave() {
+    const staveGroupIndex = trebleStaves.length; // Or bassStaves.length, assuming they grow together
     staveOffset += 270;
     div.style.height = (staveOffset + initialStaveOffset + 270) + "px"; // Adjust the SVG canvas height
     renderer.resize(800, staveOffset + initialStaveOffset + 270); // Resize renderer
-    drawStave(staveOffset + initialStaveOffset);
+    drawStave(staveOffset + initialStaveOffset, staveGroupIndex);
+    staveElementGroups[staveGroupIndex] = { treble: [], bass: [] }; // Initialize element storage for this stave group
 };
 
-function drawStave(y) {
+function drawStave(y, staveGroupIndex) {
     const context = renderer.getContext();
-    context.setFillStyle("white");
+    context.setFillStyle("white"); // Set fill style for staves if needed, or notes
 
-    // Calculate x-offset for centering the stave
     const xOffset = (800 - 780) / 2;
 
     const trebleStave = new VF.Stave(xOffset, y, 780);
     trebleStave.addClef("treble").addTimeSignature("4/4");
     trebleStave.setContext(context).draw();
+    trebleStaves[staveGroupIndex] = trebleStave;
 
-    const bassStave = new VF.Stave(xOffset, y+100, 780);
-    bassStave.addClef("bass");
+    const bassStave = new VF.Stave(xOffset, y + 100, 780);
+    bassStave.addClef("bass").addTimeSignature("4/4"); // Also add time signature for consistency
     bassStave.setContext(context).draw();
+    bassStaves[staveGroupIndex] = bassStave;
 }
 
 div.ondragover = function(event) {
@@ -250,74 +320,544 @@ div.ondragover = function(event) {
 div.ondrop = function(event) {
     event.preventDefault();
 
-    const x = event.pageX - div.offsetLeft; // Get the x-coordinate of the drop
-    const y = event.pageY - div.offsetTop; // Get the y-coordinate of the drop
-    const droppedSvgUrl = event.dataTransfer.getData('URL'); // Get the URL of the dropped SVG
-    appendSvgToStave(droppedSvgUrl, x, y + 375);
+    const x = event.pageX - div.offsetLeft;
+    const y = event.pageY - div.offsetTop;
+    const data = event.dataTransfer.getData('text');
+
+    let symbolData;
+    // Check if data is JSON (for future more complex draggable items)
+    if (data.startsWith('{')) {
+        try { symbolData = JSON.parse(data); } catch (e) { console.warn("Failed to parse JSON data:", data); }
+    }
+
+    if (!symbolData) { // If not JSON or parse failed, handle as string type
+        if (data === 'note') symbolData = { type: 'note', duration: 'q' }; // Default note
+        else if (data === 'whole-rest') symbolData = { type: 'rest', duration: 'w' };
+        else if (data === 'half-rest') symbolData = { type: 'rest', duration: 'h' };
+        else if (data === 'quarter-rest') symbolData = { type: 'rest', duration: 'q' };
+        else if (data === 'eighth-rest') symbolData = { type: 'rest', duration: '8' };
+        else if (data === 'sixteenth-rest') symbolData = { type: 'rest', duration: '16' };
+        else if (data === 'chopinmeasure') symbolData = { type: 'barline' };
+        else {
+            console.warn("Unknown dropped data type:", data);
+            return;
+        }
+    }
+
+    let staveGroupIndex = -1;
+    if (trebleStaves.length === 0) {
+        console.error("No staves to drop on.");
+        return;
+    }
+
+    for (let i = 0; i < trebleStaves.length; i++) {
+        const groupTrebleStaveY = trebleStaves[i].getY();
+        // A group's active area for dropping can be considered from the top of the treble stave
+        // to the bottom of the bass stave within that group.
+        // Treble stave height is typically 100px. Bass stave starts 100px below treble. Bass height is 100px.
+        // So, droppable height is roughly groupTrebleStaveY to groupTrebleStaveY + 200.
+        const groupBottomY = groupTrebleStaveY + 200; // Approximate end of bass stave active area for the group
+
+        if (y >= groupTrebleStaveY && y < groupBottomY) {
+            staveGroupIndex = i;
+            break;
+        }
+    }
+
+    if (staveGroupIndex === -1) {
+        // If not directly on a stave group, determine the closest one.
+        // This handles cases where the drop is slightly above the first group or below the last,
+        // or in the vertical gap between two stave groups.
+        let closestDist = Infinity;
+        let newIndex = -1;
+        for (let i = 0; i < trebleStaves.length; i++) {
+            const trebleTop = trebleStaves[i].getY();
+            const bassBottom = bassStaves[i].getY() + bassStaves[i].getHeight(); // Actual bottom of bass stave
+            const midPoint = trebleTop + 100; // Midpoint of the group's active Y range
+
+            if (y < trebleTop && i === 0) { // Above the very first stave
+                newIndex = 0;
+                break;
+            }
+            if (y >= bassBottom && i === trebleStaves.length - 1) { // Below the very last stave
+                newIndex = trebleStaves.length - 1;
+                break;
+            }
+            // For drops between staves or general proximity
+            const dist = Math.abs(y - midPoint);
+            if (dist < closestDist) {
+                closestDist = dist;
+                newIndex = i;
+            }
+        }
+        staveGroupIndex = newIndex;
+        if (staveGroupIndex === -1 && trebleStaves.length > 0) {
+            // Should have been caught by above, but as a fallback, assign to first.
+            staveGroupIndex = 0;
+        } else if (staveGroupIndex === -1) {
+            console.error("Could not determine stave group for drop and no staves exist.");
+            return;
+        }
+    }
+    
+    // ... (staveGroupIndex determination logic as before, ensure it's robust)
+    if (trebleStaves.length === 0) {
+        console.error("No staves to drop on.");
+        return;
+    }
+    for (let i = 0; i < trebleStaves.length; i++) {
+        const groupTrebleStaveY = trebleStaves[i].getY();
+        const groupBottomY = groupTrebleStaveY + 200;
+        if (y >= groupTrebleStaveY && y < groupBottomY) {
+            staveGroupIndex = i;
+            break;
+        }
+    }
+    if (staveGroupIndex === -1) {
+        let closestDist = Infinity;
+        let newIndex = -1;
+        for (let i = 0; i < trebleStaves.length; i++) {
+            const trebleTop = trebleStaves[i].getY();
+            const bassBottom = bassStaves[i].getY() + bassStaves[i].getHeight();
+            const midPoint = trebleTop + 100;
+            if (y < trebleTop && i === 0) { newIndex = 0; break; }
+            if (y >= bassBottom && i === trebleStaves.length - 1) { newIndex = trebleStaves.length - 1; break; }
+            const dist = Math.abs(y - midPoint);
+            if (dist < closestDist) { closestDist = dist; newIndex = i; }
+        }
+        staveGroupIndex = newIndex;
+        if (staveGroupIndex === -1 && trebleStaves.length > 0) staveGroupIndex = 0;
+        else if (staveGroupIndex === -1) { console.error("Could not determine stave group."); return; }
+    }
+
+    appendSvgToStave(symbolData, x, y, staveGroupIndex);
 };
 
-function appendSvgToStave(svgUrl, x, y) {
-    // Calculate the stave offset for appending the SVG
-    const staveHeight = 270;
-    let staveY = Math.floor((y - initialStaveOffset) / staveHeight) * staveHeight + initialStaveOffset;
-    
-    // Adjust for the initial stave offset
-    if (staveY === 0) {
-        staveY = initialStaveOffset;
+let barlinesData = []; // To store barline positions
+
+function getCorrectRestPitchForClef(clef) {
+    return clef === 'treble' ? 'B/4' : 'D/3'; // Standard VexFlow rest positions
+}
+
+function appendSvgToStave(symbolData, x, y, staveGroupIndex) { // Changed first param to symbolData
+    if (staveGroupIndex < 0 || staveGroupIndex >= trebleStaves.length) {
+        console.error("Invalid stave group index for symbol:", symbolData);
+        return;
     }
 
-    // Create a new stave for the SVG if necessary
-    if (staveY >= staveOffset) {
-        addStave();
+    const isRest = symbolData.type === 'rest';
+    const duration = symbolData.duration; // e.g., 'q', 'h', 'w'
+
+    if (symbolData.type === 'barline') {
+        const targetStaveForBarline = (y - trebleStaves[staveGroupIndex].getY() < 150) ? trebleStaves[staveGroupIndex] : bassStaves[staveGroupIndex];
+        const barlineX = x - targetStaveForBarline.getX();
+
+        barlinesData.push({
+            staveGroupIndex: staveGroupIndex,
+            xPosition: barlineX, // X relative to the start of the stave
+        });
+        console.log("Barline data added:", barlinesData);
+        redrawScore();
+        return;
     }
 
-    const imgElem = document.createElement("img");
-    imgElem.src = svgUrl; // The URL of the SVG
-    imgElem.style.position = "absolute";
-    imgElem.style.left = `${x}px`; // Position the SVG at the x-coordinate of the drop
+    if (symbolData.type !== 'note' && !isRest) {
+        console.log("Dropped unknown symbol type:", symbolData.type);
+        return;
+    }
 
-    // Calculate the y-coordinate for the SVG
-    const relativeY = y - staveY; // the position within the stave
-    const trebleStaveHeight = 100; // the height of the treble stave
-    const bassStaveHeight = 100; // the height of the bass stave
-    const lineSpacing = trebleStaveHeight / 4; // the spacing between the lines of the stave
-    const gap = 20; // the gap between treble and bass staves
+    const currentTrebleStave = trebleStaves[staveGroupIndex];
+    const currentBassStave = bassStaves[staveGroupIndex];
 
-    if (relativeY < trebleStaveHeight) {
-        // It's the upper (treble) stave
-        imgElem.style.top = `${staveY + Math.round(relativeY / lineSpacing) * lineSpacing}px`;
-    } else if (relativeY < trebleStaveHeight + gap) {
-        // It's in the gap between staves, align to the nearest stave
-        if (relativeY - trebleStaveHeight < gap / 2) {
-            // Closer to the treble stave
-            imgElem.style.top = `${staveY + trebleStaveHeight}px`;
-        } else {
-            // Closer to the bass stave
-            imgElem.style.top = `${staveY + trebleStaveHeight + gap}px`;
-        }
+    // Determine if it's treble or bass based on Y relative to the stave group's start
+    const staveGroupY = currentTrebleStave.getY(); // Y of the top of the treble stave in this group
+    const yRelativeToStaveGroup = y - staveGroupY;
+
+    let targetStave, clefType;
+    if (yRelativeToStaveGroup < 100) { // 100 is the height of the treble stave
+        targetStave = currentTrebleStave;
+        clefType = "treble";
+    } else if (yRelativeToStaveGroup >= 100 && yRelativeToStaveGroup < 200) { // Bass stave is 100px below treble
+        targetStave = currentBassStave;
+        clefType = "bass";
     } else {
-        // It's the lower (bass) stave
-        imgElem.style.top = `${staveY + trebleStaveHeight + gap + Math.round((relativeY - trebleStaveHeight - gap) / lineSpacing) * lineSpacing}px`;
+        // Dropped in the space between this group and the next, or below the bass stave.
+        // For simplicity, assign to the nearest one or default to bass if in the lower part of a group.
+        // This logic can be refined.
+        if (yRelativeToStaveGroup >= 200 && currentBassStave.getY() + currentBassStave.getHeight() > y) {
+             targetStave = currentBassStave;
+             clefType = "bass";
+        } else {
+            console.log("Dropped outside defined stave areas for group " + staveGroupIndex);
+            // Potentially snap to the closest line of the closest stave if desired.
+            // For now, if it's not clearly on treble or bass of *this specific group*, we might ignore.
+            // Or, determine if it's closer to the previous/next stave group if logic in ondrop wasn't precise enough.
+            // Given the current ondrop, staveGroupIndex should be correct.
+            // Let's try to assign to bass if it's just below treble.
+             targetStave = currentBassStave; // Default or choose based on proximity
+             clefType = "bass";
+        }
     }
 
-    div.appendChild(imgElem);
+    if (!targetStave) {
+        console.error("Could not determine target stave for drop at y:", y, "relative to group Y:", staveGroupY);
+        return;
+    }
+
+    // --- Y-coordinate to Pitch ---
+    // VexFlow's Y is 0 at the top line of the stave.
+    // Each line/space is 10 pixels.
+    // Example for treble: E4 (line 0), F4 (space 0), G4 (line 1), A4 (space 1), B4 (line 2), etc.
+    // Example for bass: G2 (line 0), A2 (space 0), B2 (line 1), C3 (space 1), D3 (line 2), etc.
+    const yOnStave = y - targetStave.getY();
+    let line = Math.round(yOnStave / 10); // 10 pixels per line/space
+
+    // Clamp line to valid range (e.g., -2 for two ledger lines above, to 6 for two ledger lines below for a 5-line stave)
+    // This is a simplified clamping. Real note calculation is more complex.
+    line = Math.max(-2, Math.min(line, 6)); // Allows some ledger lines
+
+    // This is a placeholder. Converting line to pitch accurately requires knowing the clef
+    // and VexFlow's specific note naming for keys.
+    // VF.Stave.getNoteForY(y) would be ideal but needs y relative to *itself*.
+    // The yOnStave is already calculated relative to targetStave.getY().
+    let pitch; // Determine pitch or rest convention
+    if (isRest) {
+        pitch = getCorrectRestPitchForClef(clefType);
+    } else { // It's a note
+        const noteDetails = targetStave.getNoteForY(yOnStave);
+        if (noteDetails && typeof noteDetails.note === 'string' && typeof noteDetails.octave === 'string') {
+             pitch = noteDetails.note.toUpperCase() + "/" + noteDetails.octave;
+        } else {
+            console.warn("VexFlow getNoteForY did not return expected details for NOTE. Falling back for yOnStave:", yOnStave, "line:", line, "clef:", clefType);
+            if (clefType === "treble") {
+                const pitches = ["F/5", "D/5", "B/4", "G/4", "E/4", "C/4"];
+                pitch = pitches[Math.min(line, pitches.length -1)] || "C/4";
+            } else { // bass
+                const pitches = ["A/3", "F/3", "D/3", "B/2", "G/2", "E/2"];
+                pitch = pitches[Math.min(line, pitches.length -1)] || "C/3";
+            }
+        }
+    }
+
+    const beatWidth = 100;
+    const xOnStave = x - targetStave.getX();
+    let beat = Math.max(0, Math.round(xOnStave / beatWidth));
+
+    const newElementData = {
+        pitch: pitch,
+        beat: beat,
+        duration: duration,
+        isRest: isRest,
+        staveGroupIndex: staveGroupIndex,
+        clef: clefType,
+        rawX: x,
+        rawY: y
+    };
+
+    // --- VALIDATION START (Applied to both notes and rests) ---
+    const MEASURE_CAPACITY = 4;
+    const currentMeasureIndex = Math.floor(newElementData.beat / MEASURE_CAPACITY);
+    const firstBeatOfMeasure = currentMeasureIndex * MEASURE_CAPACITY;
+    const lastBeatOfMeasure = firstBeatOfMeasure + MEASURE_CAPACITY - 1;
+
+    let currentMeasureDuration = 0;
+    scoreNotes.filter(item =>
+        item.staveGroupIndex === newElementData.staveGroupIndex &&
+        item.clef === newElementData.clef &&
+        item.beat >= firstBeatOfMeasure &&
+        item.beat <= lastBeatOfMeasure
+    ).forEach(item => {
+        currentMeasureDuration += getDurationValue(item.duration);
+    });
+
+    if (currentMeasureDuration + getDurationValue(newElementData.duration) > MEASURE_CAPACITY) {
+        alert("This measure is full. Cannot add the element.");
+        return;
+    }
+
+    const itemsOnThisStave = scoreNotes.filter(item =>
+        item.staveGroupIndex === newElementData.staveGroupIndex &&
+        item.clef === newElementData.clef
+    );
+
+    if (itemsOnThisStave.length > 0) {
+        let latestBeat = -1;
+        itemsOnThisStave.forEach(item => {
+            if (item.beat > latestBeat) latestBeat = item.beat;
+        });
+        if (newElementData.beat - latestBeat > 4) {
+             alert("The new element is too far from the previous one (max 4 beats difference).");
+             return;
+        }
+    }
+    // --- VALIDATION END ---
+
+    scoreNotes.push(newElementData);
+    console.log("Added element:", newElementData, "Total score items:", scoreNotes.length);
+
+    redrawScore(); // Centralized redraw function
+}
+
+// Centralized redraw function
+function redrawScore() {
+    const context = renderer.getContext();
+    context.clear();
+
+    // Redraw staves
+    for (let i = 0; i < trebleStaves.length; i++) {
+        trebleStaves[i].setContext(context).draw();
+        bassStaves[i].setContext(context).draw();
+    }
+
+    // Redraw barlines
+    barlinesData.forEach(barlineInfo => {
+        if (barlineInfo.staveGroupIndex < trebleStaves.length) { // Check if stave group still exists
+            const trebleStave = trebleStaves[barlineInfo.staveGroupIndex];
+            const bassStave = bassStaves[barlineInfo.staveGroupIndex];
+
+            const barline = new VF.Barline(VF.Barline.type.SINGLE); // Or other types
+            // Draw on treble, relative to the start of the notes area on the stave
+            barline.setX(trebleStave.getNoteStartX() + barlineInfo.xPosition);
+            barline.draw(trebleStave.getContext());
+
+            // Draw on bass, assuming xPosition is relative to the start of the stave notes area
+            barline.setX(bassStave.getNoteStartX() + barlineInfo.xPosition);
+            barline.draw(bassStave.getContext());
+        }
+    });
+
+    // Rebuild staveElementGroups from scoreNotes for notes and rests
+    staveElementGroups.forEach(group => {
+        group.treble = [];
+        group.bass = [];
+    });
+
+    const itemsByStaveAndBeat = {}; // Renamed from notesByStaveAndBeat
+
+    scoreNotes.forEach(item => { // item can be note or rest
+        const key = `${item.staveGroupIndex}-${item.clef}-${item.beat}`;
+        if (!itemsByStaveAndBeat[key]) {
+            itemsByStaveAndBeat[key] = {
+                staveGroupIndex: item.staveGroupIndex,
+                clef: item.clef,
+                beat: item.beat,
+                duration: item.duration || "q",
+                keys: [],
+                isRest: item.isRest || false
+            };
+        }
+        itemsByStaveAndBeat[key].keys.push(item.pitch.toUpperCase());
+        if (item.isRest) itemsByStaveAndBeat[key].isRest = true;
+    });
+
+    Object.values(itemsByStaveAndBeat).forEach(itemData => {
+        if (itemData.keys.length > 0) { // Keys will contain pitch for notes, or conventional pitch for rests
+            let vfDuration = itemData.duration;
+            if (itemData.isRest) {
+                vfDuration += "r"; // Append 'r' for VexFlow rest duration (e.g., "qr", "hr")
+            }
+
+            const staveItem = new VF.StaveNote({ // Use a generic name like staveItem
+                keys: itemData.keys.map(k => k.toUpperCase()),
+                duration: vfDuration,
+                clef: itemData.clef,
+                auto_stem: !itemData.isRest // Rests don't have stems
+            });
+
+            // Add accidentals if it's a note and has accidentals in keys
+            if (!itemData.isRest) {
+                itemData.keys.forEach((key, index) => {
+                    if (key.includes("#") || key.includes("b")) {
+                        // VexFlow typically handles this if keys are like "C#/4"
+                        // If explicit accidental objects are needed:
+                        // const accidentalType = key.includes("##") ? "##" : (key.includes("#") ? "#" : (key.includes("bb") ? "bb" : "b"));
+                        // staveItem.addAccidental(index, new VF.Accidental(accidentalType));
+                    }
+                });
+            }
+
+            if (staveElementGroups[itemData.staveGroupIndex]) {
+                if (itemData.clef === 'treble') {
+                    staveElementGroups[itemData.staveGroupIndex].treble.push(staveItem);
+                } else {
+                    staveElementGroups[itemData.staveGroupIndex].bass.push(staveItem);
+                }
+            } else {
+                console.error("Attempted to add item to non-existent stave group:", itemData.staveGroupIndex);
+            }
+        }
+    });
+    staveElementGroups.forEach((group, groupIndex) => {
+        const currentTrebleStave = trebleStaves[groupIndex];
+        const currentBassStave = bassStaves[groupIndex];
+
+        if (group.treble.length > 0) {
+            group.treble.sort((a, b) => {
+                const beatA = Object.values(notesByStaveAndBeat).find(data => data.keys.includes(a.getKeys()[0].toUpperCase()))?.beat;
+                const beatB = Object.values(notesByStaveAndBeat).find(data => data.keys.includes(b.getKeys()[0].toUpperCase()))?.beat;
+                return beatA - beatB;
+            });
+
+            const trebleVoice = new VF.Voice({ num_beats: 4, beat_value: 4 });
+            trebleVoice.setStrict(false);
+            trebleVoice.addTickables(group.treble);
+            new VF.Formatter().joinVoices([trebleVoice]).format([trebleVoice], currentTrebleStave.getWidth() - currentTrebleStave.getModifierXShift());
+            trebleVoice.draw(context, currentTrebleStave);
+        }
+        if (group.bass.length > 0) {
+            group.bass.sort((a, b) => {
+                const beatA = Object.values(notesByStaveAndBeat).find(data => data.keys.includes(a.getKeys()[0].toUpperCase()))?.beat;
+                const beatB = Object.values(notesByStaveAndBeat).find(data => data.keys.includes(b.getKeys()[0].toUpperCase()))?.beat;
+                return beatA - beatB;
+            });
+
+            const bassVoice = new VF.Voice({ num_beats: 4, beat_value: 4 });
+            bassVoice.setStrict(false);
+            bassVoice.addTickables(group.bass);
+            new VF.Formatter().joinVoices([bassVoice]).format([bassVoice], currentBassStave.getWidth() - currentBassStave.getModifierXShift());
+            bassVoice.draw(context, currentBassStave);
+        }
+    });
+}
+
+addStave(); // Add the first stave system on load
+
+// Synth for playback - Changed to Tone.Sampler for higher quality audio
+let synth; // Will be our Tone.Sampler
+const MEASURE_CAPACITY = 4; // Assuming 4/4 time, used for playback timing
+
+// --- Tone.Sampler Setup ---
+// IMPORTANT: These are placeholder URLs. Replace with actual URLs to your audio samples.
+const samples = {
+    "C4": "https://example.com/path/to/C4.mp3",
+    "D4": "https://example.com/path/to/D4.mp3",
+    "E4": "https://example.com/path/to/E4.mp3",
+    "F4": "https://example.com/path/to/F4.mp3",
+    "G4": "https://example.com/path/to/G4.mp3",
+    "A4": "https://example.com/path/to/A4.mp3",
+    "B4": "https://example.com/path/to/B4.mp3",
+    "C5": "https://example.com/path/to/C5.mp3",
+    // Add more notes and octaves as needed for your score.
+    // For example: "Db4", "C#4", "F#5", etc.
+};
+
+synth = new Tone.Sampler({
+    urls: samples,
+    baseUrl: "", // Assuming full URLs are provided in 'samples' map
+    onload: () => {
+        console.log("Tone.Sampler loaded successfully.");
+        const playbackButton = document.getElementById('playback');
+        if (playbackButton) {
+            playbackButton.disabled = false;
+            // Set text to 'Play' or 'Stop' based on current transport state if needed
+            // For simplicity, just ensuring it's enabled and has a sensible default.
+            if (Tone.Transport.state !== "started") {
+                 playbackButton.textContent = "Play";
+            } else {
+                 playbackButton.textContent = "Stop";
+            }
+        }
+    },
+    onerror: (error) => {
+        console.error("Error loading samples for Tone.Sampler:", error);
+        // Fallback or notify user, e.g., re-enable button with an error message or use PolySynth as fallback.
+        const playbackButton = document.getElementById('playback');
+        if (playbackButton) {
+            playbackButton.disabled = false;
+            playbackButton.textContent = "Play (Error)";
+        }
+        // As a fallback, one could initialize PolySynth here if Sampler fails
+        // synth = new Tone.PolySynth(Tone.Synth).toDestination();
+        // console.log("Fell back to PolySynth due to Sampler loading error.");
+    }
+}).toDestination();
+// --- End Tone.Sampler Setup ---
+
+
+function getToneDuration(vfDuration) {
+    const map = { "w": "1n", "h": "2n", "q": "4n", "8": "8n", "16": "16n" };
+    return map[vfDuration] || "4n"; // Default to quarter note if mapping not found
+}
+
+function getTonePitch(vfPitch) {
+    if (typeof vfPitch !== 'string') return "C4"; // Fallback for safety
+    return vfPitch.replace("/", ""); // e.g., "C/4" -> "C4"
+}
+
+function playScore() {
+    if (!synth || !synth.loaded) {
+        alert("Audio samples are still loading or failed to load. Please wait or check the console.");
+        // Ensure button state reflects this, e.g., it should ideally be disabled.
+        const playbackButton = document.getElementById('playback');
+        if(playbackButton && synth && !synth.loaded) playbackButton.textContent = "Loading Samples...";
+        return;
+    }
+
+    if (Tone.Transport.state === "started") {
+        Tone.Transport.stop();
+        Tone.Transport.cancel(0); // Clear all scheduled events
+        // Update button text or UI if needed, e.g., change "Stop" back to "Play"
+        document.getElementById('playback').textContent = 'Play';
+        return;
+    }
+
+    Tone.Transport.cancel(0); // Clear any previous events before scheduling new ones
+
+    const notesToPlay = {}; // Object to group notes by their scheduled time for chord playback
+
+    scoreNotes.forEach(note => {
+        // Calculate Tone.js compatible time (measure:beat:sixteenths)
+        const measure = Math.floor(note.beat / MEASURE_CAPACITY);
+        const quarterBeat = note.beat % MEASURE_CAPACITY;
+        const time = `${measure}:${quarterBeat}:0`;
+
+        if (!notesToPlay[time]) {
+            notesToPlay[time] = {
+                pitches: [],
+                // Assuming all notes in a chord at a specific time have the same duration
+                // This uses the duration of the first note encountered at this time.
+                duration: getToneDuration(note.duration)
+            };
+        }
+        notesToPlay[time].pitches.push(getTonePitch(note.pitch));
+    });
+
+    for (const time in notesToPlay) {
+        const event = notesToPlay[time];
+        if (event.pitches.length > 0) {
+            console.log(`Scheduling at ${time}: pitches=${event.pitches.join(', ')}, duration=${event.duration}`);
+            synth.triggerAttackRelease(event.pitches, event.duration, time);
+        }
+    }
+
+    Tone.Transport.start("+0.1"); // Start transport slightly in the future to allow for scheduling
+    // Update button text or UI, e.g., change "Play" to "Stop"
+    document.getElementById('playback').textContent = 'Stop';
+}
+
+// Ensure this listener replacement is robust and UI is updated for loading
+const initialPlaybackButton = document.getElementById('playback');
+if (initialPlaybackButton) {
+    initialPlaybackButton.disabled = true;
+    initialPlaybackButton.textContent = "Loading Samples...";
+
+    // Replace listener logic (cloning to remove old ones)
+    const newPlaybackButton = initialPlaybackButton.cloneNode(true);
+    if (initialPlaybackButton.parentNode) {
+        initialPlaybackButton.parentNode.replaceChild(newPlaybackButton, initialPlaybackButton);
+    }
+    newPlaybackButton.addEventListener('click', playScore);
+    // Note: The 'playbackButton' variable in Sampler's onload will refer to the new button
+    // if this onload fires after the replacement. If it fires before, it gets the old one.
+    // To be safe, Sampler's onload should re-fetch the button by ID.
 }
 
 
-addStave();
+// The following functions changeTone and playStaves seem to be unused or placeholders
+// and were also attached to the old synth. They can be removed or updated if needed.
+// For this subtask, they are not directly relevant to playScore.
 
-// Synth for playback
-const synth = new Tone.Synth().toDestination();
-
-// MIDI conversion
-const midi = new Tone.Frequency("B4").toMidi(); // Change "B4" to the note you want
-
-document.getElementById('playback').addEventListener('click', function() {
-  const now = Tone.now()
-  synth.triggerAttackRelease(Tone.Frequency(midi, "midi").toFrequency(), 0.2, now);
-});
-
-
+/*
 // Changes the tone of the library to the given note where it was dropped on the stave
 const changeTone = (note) => {
   // Code to change the tone of the library to the given note
@@ -340,10 +880,7 @@ const playStaves = (notes) => {
     }, index * 200); // Play each note with a delay of 200 ms
   });
 }
-document.getElementById('playback').addEventListener('click', function() {
-    const now = Tone.now()
-    synth.triggerAttackRelease(Tone.Frequency(midi, "midi").toFrequency(), 0.2, now);
-});
+*/
 </script>
 </body>
 </html>
