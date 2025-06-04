@@ -223,11 +223,280 @@ let scoreNotes = [];
 let trebleStaves = [];
 let bassStaves = [];
 let staveElementGroups = []; // To store notes for each stave group
+let selectedNoteIndices = []; // For note selection
+
+// --- Global Drag State Variables ---
+let isDragging = false;
+let dragNoteInitialIndices = [];
+let dragStartX = 0;
+let dragStartY = 0;
+let dragOriginalNoteStates = [];
+const BEAT_WIDTH = 100; // Assuming 100px per beat, adjust if necessary
+const MEASURE_CAPACITY = 4; // For 4/4 time, used for validation and playback. Define globally.
 
 window.onload = function() {
     document.getElementById('add-stave').addEventListener('click', addStave);
     document.getElementById('export-pdf').addEventListener('click', exportPDF);
+
+    const vfDiv = document.getElementById('vf');
+    if (vfDiv) {
+        vfDiv.addEventListener('mousedown', handleMouseDownOnScore);
+        // Mousemove and mouseup listeners are added to the document to capture events
+        // even if the mouse moves outside vfDiv during a drag.
+        document.addEventListener('mousemove', handleMouseMoveScore);
+        document.addEventListener('mouseup', handleMouseUpScore);
+
+        // Existing click listener for selection (might need integration or careful ordering with mousedown)
+        // For now, the mousedown will also handle selection updates.
+        // The previous click listener for selection is complex, mousedown will simplify and integrate drag start.
+        vfDiv.removeEventListener('click', vfDivClickListener); // Attempt to remove previous generic click listener if it was named
+        // Re-adding a simpler click for non-drag selection clearing:
+        vfDiv.addEventListener('click', handleScoreClickForSelectionClear);
+    }
+
+    const vfDiv = document.getElementById('vf');
 };
+
+// Simplified click handler for clearing selection if a drag didn't start
+function handleScoreClickForSelectionClear(event) {
+    if (isDragging) return; // If a drag operation just concluded, mouseup will handle redraw.
+
+    let target = event.target;
+    let isNoteClick = false;
+    while (target && target !== this) { // 'this' is vfDiv
+        if (target.matches && target.matches('g[id^="vfitem-"]')) {
+            isNoteClick = true;
+            break;
+        }
+        target = target.parentNode;
+    }
+
+    if (!isNoteClick && !event.ctrlKey) {
+        if (selectedNoteIndices.length > 0) {
+            selectedNoteIndices = [];
+            console.log("Selection cleared by click on empty space.");
+            redrawScore();
+        }
+    }
+}
+
+
+function handleMouseDownOnScore(event) {
+    // Ensure vfDiv is accessible, e.g., by defining it globally or passing it.
+    // For this structure, assuming vfDiv is the event.currentTarget or this.
+    const localVfDiv = document.getElementById('vf'); // Or event.currentTarget
+
+    let target = event.target;
+    let noteGroupElement = null;
+    while (target && target !== localVfDiv) {
+        if (target.matches && target.matches('g[id^="vfitem-"]')) {
+            noteGroupElement = target;
+            break;
+        }
+        target = target.parentNode;
+    }
+
+    if (noteGroupElement) {
+        // event.preventDefault(); // Prevent text selection, etc.
+        const id = noteGroupElement.id;
+        const indicesStr = id.replace('vfitem-', '').split('-');
+        const clickedIndices = indicesStr.map(s => parseInt(s, 10)).filter(idx => idx >= 0 && idx < scoreNotes.length);
+
+        if (clickedIndices.length === 0) {
+            isDragging = false; return;
+        }
+
+        let selectionChangedDueToThisClick = false;
+        if (!event.ctrlKey) {
+            let isAlreadySoleSelection = selectedNoteIndices.length === clickedIndices.length && clickedIndices.every(idx => selectedNoteIndices.includes(idx));
+            if (!isAlreadySoleSelection) {
+                selectedNoteIndices = [...clickedIndices];
+                selectionChangedDueToThisClick = true;
+            }
+        } else {
+            clickedIndices.forEach(idx => {
+                const currentSelectionIdx = selectedNoteIndices.indexOf(idx);
+                if (currentSelectionIdx > -1) selectedNoteIndices.splice(currentSelectionIdx, 1);
+                else selectedNoteIndices.push(idx);
+            });
+            selectionChangedDueToThisClick = true;
+        }
+
+        if (selectedNoteIndices.length > 0) {
+            isDragging = true;
+            dragNoteInitialIndices = [...selectedNoteIndices];
+            dragOriginalNoteStates = dragNoteInitialIndices.map(index => {
+                const note = scoreNotes[index];
+                return {
+                    originalIndex: index, pitch: note.pitch, beat: note.beat,
+                    staveGroupIndex: note.staveGroupIndex, clef: note.clef,
+                    duration: note.duration, isRest: note.isRest || false
+                };
+            });
+            dragStartX = event.clientX;
+            dragStartY = event.clientY;
+            console.log("Starting drag for indices:", dragNoteInitialIndices);
+        } else {
+            isDragging = false;
+        }
+
+        if (selectionChangedDueToThisClick) redrawScore();
+
+    } else {
+        // If click was not on a note item, the generic click handler handleScoreClickForSelectionClear will manage it.
+        isDragging = false;
+    }
+}
+
+function handleMouseMoveScore(event) {
+    if (!isDragging) return;
+    event.preventDefault();
+    // Real-time visual feedback could be added here (e.g., moving a ghost element)
+    // For now, we only update on mouseup.
+    // console.log("Dragging...", event.clientX - dragStartX);
+}
+
+function handleMouseUpScore(event) {
+    const wasDragging = isDragging;
+    isDragging = false;
+
+    if (!wasDragging || dragNoteInitialIndices.length === 0) {
+        // If not dragging, and selection might have changed on mousedown, redraw.
+        // The mousedown now calls redraw if selection changed.
+        // If it was just a click that didn't result in a drag, redraw might have happened.
+        // This redrawScore() call here is a safety net.
+        // redrawScore(); // Might be redundant if mousedown already redrew.
+        dragNoteInitialIndices = [];
+        dragOriginalNoteStates = [];
+        return;
+    }
+
+    event.preventDefault();
+
+    const deltaX = event.clientX - dragStartX;
+    const beatChange = BEAT_WIDTH === 0 ? 0 : Math.round(deltaX / BEAT_WIDTH);
+
+    if (beatChange === 0 && Math.abs(event.clientY - dragStartY) < 5) { // If no significant drag
+        console.log("Drag was too short, no change in position.");
+        dragNoteInitialIndices = [];
+        dragOriginalNoteStates = [];
+        // redrawScore(); // Already redrawn in mousedown if selection changed
+        return;
+    }
+
+    if (Math.abs(event.clientY - dragStartY) > 15) { // 15px tolerance for Y movement
+         console.warn("Y-axis (pitch) dragging is not implemented. Note pitch will not change.");
+    }
+
+    let allMovesAreValid = true;
+    const proposedChanges = [];
+
+    for (const originalState of dragOriginalNoteStates) {
+        let newBeat = originalState.beat + beatChange;
+        newBeat = Math.max(0, newBeat);
+
+        const proposedNote = { ...originalState, beat: newBeat };
+        proposedChanges.push(proposedNote);
+    }
+
+    // Create a temporary representation of scoreNotes to validate against
+    let tempScoreNotesForValidation = JSON.parse(JSON.stringify(scoreNotes));
+
+    proposedChanges.forEach(change => {
+        if(change.originalIndex >= 0 && change.originalIndex < tempScoreNotesForValidation.length) {
+            // Apply the change to the temporary list for validation context
+            tempScoreNotesForValidation[change.originalIndex] = {
+                ...tempScoreNotesForValidation[change.originalIndex],
+                beat: change.beat,
+                // pitch: change.pitch // Pitch doesn't change in this subtask
+            };
+        } else {
+            console.error("Invalid originalIndex in proposedChange during validation setup:", change);
+            allMovesAreValid = false;
+        }
+    });
+
+    if (!allMovesAreValid) {
+        console.error("Drag operation aborted due to invalid index mapping during validation setup.");
+        dragNoteInitialIndices = [];
+        dragOriginalNoteStates = [];
+        redrawScore();
+        return;
+    }
+
+    // Validate each proposed change within the context of all other proposed changes
+    for (const changedNote of proposedChanges) {
+        // 1. Measure capacity validation (using the temporary, fully updated score state)
+        const measureIndex = Math.floor(changedNote.beat / MEASURE_CAPACITY);
+        const firstBeatOfMeasure = measureIndex * MEASURE_CAPACITY;
+        const lastBeatOfMeasure = firstBeatOfMeasure + MEASURE_CAPACITY - 1;
+        let currentMeasureDuration = 0;
+
+        tempScoreNotesForValidation.forEach((noteInMeasure, idx) => {
+            if (noteInMeasure.staveGroupIndex === changedNote.staveGroupIndex &&
+                noteInMeasure.clef === changedNote.clef &&
+                noteInMeasure.beat >= firstBeatOfMeasure &&
+                noteInMeasure.beat <= lastBeatOfMeasure) {
+                currentMeasureDuration += getDurationValue(noteInMeasure.duration);
+            }
+        });
+
+        if (currentMeasureDuration > MEASURE_CAPACITY) {
+            allMovesAreValid = false;
+            alert(`Invalid move for note ${changedNote.pitch} to beat ${changedNote.beat}: Measure would be full (${currentMeasureDuration} > ${MEASURE_CAPACITY}).`);
+            break;
+        }
+
+        // 2. Proximity validation (ensure it's not too far from its new neighbors)
+        // This needs to be checked against other notes in tempScoreNotesForValidation,
+        // excluding the note itself if it were at its old position.
+        let latestBeatBeforeChange = -Infinity;
+        let earliestBeatAfterChange = Infinity;
+
+        tempScoreNotesForValidation.forEach((otherNote, idx) => {
+            if (otherNote.originalIndex === changedNote.originalIndex) return; // Don't compare with self in its new pos
+            if (otherNote.staveGroupIndex === changedNote.staveGroupIndex && otherNote.clef === changedNote.clef) {
+                if (otherNote.beat < changedNote.beat) {
+                    if (otherNote.beat > latestBeatBeforeChange) latestBeatBeforeChange = otherNote.beat;
+                }
+                if (otherNote.beat > changedNote.beat) {
+                     if (otherNote.beat < earliestBeatAfterChange) earliestBeatAfterChange = otherNote.beat;
+                }
+            }
+        });
+
+        if (latestBeatBeforeChange !== -Infinity && (changedNote.beat - latestBeatBeforeChange > 4)) {
+             allMovesAreValid = false;
+             alert(`Invalid move for note ${changedNote.pitch} to beat ${changedNote.beat}: New position is too far from the preceding note.`);
+             break;
+        }
+        if (earliestBeatAfterChange !== Infinity && (earliestBeatAfterChange - changedNote.beat > 4)) {
+            allMovesAreValid = false;
+            alert(`Invalid move for note ${changedNote.pitch} to beat ${changedNote.beat}: New position is too far from the succeeding note.`);
+            break;
+        }
+    }
+
+    if (allMovesAreValid) {
+        proposedChanges.forEach(change => {
+             if(change.originalIndex >= 0 && change.originalIndex < scoreNotes.length) {
+                scoreNotes[change.originalIndex].beat = change.beat;
+                // scoreNotes[change.originalIndex].pitch = change.pitch; // Pitch doesn't change
+            } else {
+                 console.error("Invalid originalIndex in proposedChange during final application:", change);
+            }
+        });
+        console.log("Note(s) moved successfully to new beat positions.");
+    } else {
+        console.log("Move validation failed. Notes remain in original positions.");
+        // No changes were made to the actual scoreNotes, so they are already in original state.
+    }
+
+    dragNoteInitialIndices = [];
+    dragOriginalNoteStates = [];
+    redrawScore();
+}
+
 
 function exportPDF() {
     const vexflowDiv = document.getElementById('vf');
@@ -399,7 +668,7 @@ div.ondrop = function(event) {
             return;
         }
     }
-    
+
     // ... (staveGroupIndex determination logic as before, ensure it's robust)
     if (trebleStaves.length === 0) {
         console.error("No staves to drop on.");
@@ -520,21 +789,33 @@ function appendSvgToStave(symbolData, x, y, staveGroupIndex) { // Changed first 
     // and VexFlow's specific note naming for keys.
     // VF.Stave.getNoteForY(y) would be ideal but needs y relative to *itself*.
     // The yOnStave is already calculated relative to targetStave.getY().
-    let pitch; // Determine pitch or rest convention
+    let pitch;
+    let isUserMiddleCRuleApplied = false; // Flag to track if Middle C rule is applied
+
     if (isRest) {
         pitch = getCorrectRestPitchForClef(clefType);
     } else { // It's a note
-        const noteDetails = targetStave.getNoteForY(yOnStave);
-        if (noteDetails && typeof noteDetails.note === 'string' && typeof noteDetails.octave === 'string') {
-             pitch = noteDetails.note.toUpperCase() + "/" + noteDetails.octave;
+        const vexFlowLineNum = targetStave.getLineForY(yOnStave);
+        const MIDDLE_LINE_VEXFLOW_INDEX = 2;
+
+        if (Math.round(vexFlowLineNum) === MIDDLE_LINE_VEXFLOW_INDEX && (clefType === 'treble' || clefType === 'bass')) {
+            pitch = "C/4";
+            isUserMiddleCRuleApplied = true; // Set the flag
+            console.log(`User Middle C rule: Assigning C/4 for drop on middle line (VexFlow line ${vexFlowLineNum.toFixed(2)}) of ${clefType} stave. Flagged for special rendering.`);
         } else {
-            console.warn("VexFlow getNoteForY did not return expected details for NOTE. Falling back for yOnStave:", yOnStave, "line:", line, "clef:", clefType);
-            if (clefType === "treble") {
-                const pitches = ["F/5", "D/5", "B/4", "G/4", "E/4", "C/4"];
-                pitch = pitches[Math.min(line, pitches.length -1)] || "C/4";
-            } else { // bass
-                const pitches = ["A/3", "F/3", "D/3", "B/2", "G/2", "E/2"];
-                pitch = pitches[Math.min(line, pitches.length -1)] || "C/3";
+            const noteDetails = targetStave.getNoteForY(yOnStave);
+            if (noteDetails && typeof noteDetails.note === 'string' && typeof noteDetails.octave === 'string') {
+                 pitch = noteDetails.note.toUpperCase() + "/" + noteDetails.octave;
+            } else {
+                // Fallback uses the 'line' variable calculated earlier (approximate line based on 10px steps)
+                console.warn("VexFlow getNoteForY did not return expected details for NOTE. Falling back. yOnStave:", yOnStave, "approx line:", line, "clef:", clefType);
+                if (clefType === "treble") {
+                    const pitches = ["F/5", "D/5", "B/4", "G/4", "E/4", "C/4"]; // Approx for lines 0-5 from top
+                    pitch = pitches[Math.min(line, pitches.length -1)] || "C/4";
+                } else { // bass
+                    const pitches = ["A/3", "F/3", "D/3", "B/2", "G/2", "E/2"]; // Approx for lines 0-5 from top
+                    pitch = pitches[Math.min(line, pitches.length -1)] || "C/3";
+                }
             }
         }
     }
@@ -548,6 +829,7 @@ function appendSvgToStave(symbolData, x, y, staveGroupIndex) { // Changed first 
         beat: beat,
         duration: duration,
         isRest: isRest,
+        isUserMiddleC: isUserMiddleCRuleApplied, // Add the flag to the note data
         staveGroupIndex: staveGroupIndex,
         clef: clefType,
         rawX: x,
@@ -639,39 +921,77 @@ function redrawScore() {
         if (!itemsByStaveAndBeat[key]) {
             itemsByStaveAndBeat[key] = {
                 staveGroupIndex: item.staveGroupIndex,
-                clef: item.clef,
+                clef: item.clef, // Store the actual clef of the note from scoreNotes
                 beat: item.beat,
                 duration: item.duration || "q",
-                keys: [],
-                isRest: item.isRest || false
+                keys: [], // These will be the true sounding pitches
+                displayKeys: [], // These will be the visually transposed pitches if needed
+                isRest: item.isRest || false,
+                isUserMiddleCAppliedToAnyNoteInThisGroup: false, // Flag for the group
+                originalIndices: []
             };
         }
-        itemsByStaveAndBeat[key].keys.push(item.pitch.toUpperCase());
-        if (item.isRest) itemsByStaveAndBeat[key].isRest = true;
+
+        const originalIndex = scoreNotes.indexOf(item);
+        if (originalIndex !== -1 && !itemsByStaveAndBeat[key].originalIndices.includes(originalIndex)) {
+            itemsByStaveAndBeat[key].originalIndices.push(originalIndex);
+        } else if (originalIndex === -1) {
+             console.warn("Item not found in scoreNotes for originalIndex tracking:", item);
+        }
+
+        itemsByStaveAndBeat[key].keys.push(item.pitch.toUpperCase()); // Store the true pitch
+        if (item.isRest) {
+            itemsByStaveAndBeat[key].isRest = true;
+            itemsByStaveAndBeat[key].displayKeys.push(getCorrectRestPitchForClef(item.clef).toUpperCase());
+        } else if (item.isUserMiddleC && item.pitch === "C/4") {
+            if (item.clef === 'treble') {
+                itemsByStaveAndBeat[key].displayKeys.push("B/4");
+            } else if (item.clef === 'bass') {
+                itemsByStaveAndBeat[key].displayKeys.push("D/3");
+            } else {
+                itemsByStaveAndBeat[key].displayKeys.push(item.pitch.toUpperCase()); // Should not happen based on rule
+            }
+            itemsByStaveAndBeat[key].isUserMiddleCAppliedToAnyNoteInThisGroup = true;
+        } else {
+            itemsByStaveAndBeat[key].displayKeys.push(item.pitch.toUpperCase());
+        }
     });
 
     Object.values(itemsByStaveAndBeat).forEach(itemData => {
-        if (itemData.keys.length > 0) { // Keys will contain pitch for notes, or conventional pitch for rests
+        if (itemData.keys.length > 0) {
             let vfDuration = itemData.duration;
             if (itemData.isRest) {
-                vfDuration += "r"; // Append 'r' for VexFlow rest duration (e.g., "qr", "hr")
+                vfDuration += "r";
             }
 
-            const staveItem = new VF.StaveNote({ // Use a generic name like staveItem
+            const staveItem = new VF.StaveNote({
                 keys: itemData.keys.map(k => k.toUpperCase()),
                 duration: vfDuration,
                 clef: itemData.clef,
-                auto_stem: !itemData.isRest // Rests don't have stems
+                auto_stem: !itemData.isRest
             });
 
-            // Add accidentals if it's a note and has accidentals in keys
+            if (itemData.originalIndices && itemData.originalIndices.length > 0) {
+                const sortedOriginalIndices = [...itemData.originalIndices].sort((a,b) => a-b);
+                const id = 'vfitem-' + sortedOriginalIndices.join('-');
+                staveItem.setId(id);
+            } else {
+                 // Fallback if no original indices (should ideally not happen)
+                staveItem.setId('vfitem-unknown-' + Math.random().toString(36).substr(2, 9));
+                 console.warn("Renderable item created with no originalIndices:", itemData);
+            }
+
+            const isSelected = itemData.originalIndices && itemData.originalIndices.some(idx => selectedNoteIndices.includes(idx));
+            if (isSelected) {
+                staveItem.setStyle({ fillStyle: "blue", strokeStyle: "blue" });
+            } else {
+                staveItem.setStyle({ fillStyle: "black", strokeStyle: "black" });
+            }
+
             if (!itemData.isRest) {
                 itemData.keys.forEach((key, index) => {
                     if (key.includes("#") || key.includes("b")) {
-                        // VexFlow typically handles this if keys are like "C#/4"
-                        // If explicit accidental objects are needed:
-                        // const accidentalType = key.includes("##") ? "##" : (key.includes("#") ? "#" : (key.includes("bb") ? "bb" : "b"));
-                        // staveItem.addAccidental(index, new VF.Accidental(accidentalType));
+                        // VexFlow handles this if keys are "C#/4".
                     }
                 });
             }
@@ -724,7 +1044,7 @@ addStave(); // Add the first stave system on load
 
 // Synth for playback - Changed to Tone.Sampler for higher quality audio
 let synth; // Will be our Tone.Sampler
-const MEASURE_CAPACITY = 4; // Assuming 4/4 time, used for playback timing
+// const MEASURE_CAPACITY = 4; // Now defined globally above
 
 // --- Tone.Sampler Setup ---
 // IMPORTANT: These are placeholder URLs. Replace with actual URLs to your audio samples.
